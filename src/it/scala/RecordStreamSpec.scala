@@ -3,18 +3,23 @@ package com.iravid.fs2.kafka.client
 import cats.implicits._
 import cats.effect.IO
 import com.iravid.fs2.kafka.codecs.{ KafkaDecoder, KafkaEncoder }
+import net.manub.embeddedkafka.{ EmbeddedKafka, EmbeddedKafkaConfig }
+import org.scalacheck.{ Gen, Shrink }
 import org.scalatest._
 import org.scalatest.Matchers._
+import org.scalatest.prop.GeneratorDrivenPropertyChecks
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
-import scala.util.Random
 
-trait KafkaSettings {
-  def consumerSettings = ConsumerSettings(
+trait KafkaSettings extends EmbeddedKafka { self: Suite =>
+  def kafkaConfig: EmbeddedKafkaConfig =
+    EmbeddedKafkaConfig(kafkaPort = 0, zooKeeperPort = 0)
+
+  def mkConsumerSettings(port: Int, groupId: String) = ConsumerSettings(
     Map(
-      "bootstrap.servers" -> "localhost:9092",
-      "group.id"          -> "testbla",
+      "bootstrap.servers" -> s"localhost:$port",
+      "group.id"          -> groupId,
       "auto.offset.reset" -> "earliest"
     ),
     10,
@@ -25,9 +30,9 @@ trait KafkaSettings {
     10.seconds
   )
 
-  def producerSettings = ProducerSettings(
+  def mkProducerSettings(port: Int) = ProducerSettings(
     Map(
-      "bootstrap.servers" -> "localhost:9092",
+      "bootstrap.servers" -> s"localhost:${port}",
     ),
     5.seconds
   )
@@ -38,30 +43,30 @@ trait KafkaSettings {
   implicit def encoder: KafkaEncoder[String] =
     KafkaEncoder.instance(str => (None, KafkaEncoder.Value(str.getBytes)))
 
-  def testData = List("a", "b", "c", "d")
-
-  def produce(data: List[String], topic: String, partition: Int = 0) =
-    Producer.create[IO](producerSettings) use { producer =>
-      data traverse { msg =>
-        Producer.produce[IO, String](producer, msg, topic, partition, None)
+  def produce(settings: ProducerSettings, topic: String, data: List[(Int, String)]) =
+    Producer.create[IO](settings) use { producer =>
+      data traverse {
+        case (partition, msg) =>
+          Producer.produce[IO, String](producer, msg, topic, partition, None)
       }
     }
 }
 
-class RecordStreamIntegrationSpec extends WordSpec with KafkaSettings {
-  def recordStream(topic: String) =
+class RecordStreamIntegrationSpec
+    extends WordSpec with KafkaSettings with GeneratorDrivenPropertyChecks {
+  def recordStream(settings: ConsumerSettings, topic: String) =
     for {
-      consumer <- KafkaConsumer[IO](consumerSettings)
-      recordStream <- RecordStream[IO, String](
-                       consumerSettings,
-                       consumer,
-                       Subscription.Topics(List(topic)))
+      consumer     <- KafkaConsumer[IO](settings)
+      recordStream <- RecordStream[IO, String](settings, consumer, Subscription.Topics(List(topic)))
     } yield recordStream
 
-  def program(topic: String) =
+  def program(consumerSettings: ConsumerSettings,
+              producerSettings: ProducerSettings,
+              topic: String,
+              data: List[String]) =
     for {
-      _ <- produce(testData, topic)
-      results <- recordStream(topic) use { recordStream =>
+      _ <- produce(producerSettings, topic, data.tupleLeft(1))
+      results <- recordStream(consumerSettings, topic) use { recordStream =>
                   recordStream.records
                     .evalMap { record =>
                       val commitReq =
@@ -71,36 +76,46 @@ class RecordStreamIntegrationSpec extends WordSpec with KafkaSettings {
                         record.fa
                       } <* recordStream.commitQueue.requestCommit(commitReq)
                     }
-                    .take(testData.length.toLong)
+                    .take(data.length.toLong)
                     .compile
                     .toVector
                 }
     } yield results
 
   "The plain consumer" should {
-    "work properly" in {
-      val results = program(Random.alphanumeric.take(5).mkString).unsafeRunSync()
+    "work properly" in withRunningKafkaOnFoundPort(kafkaConfig) { config =>
+      forAll(Gen.alphaStr, Gen.alphaStr, Gen.listOf(Gen.alphaStr)) {
+        (groupId: String, topic: String, data: List[String]) =>
+          val consumerSettings = mkConsumerSettings(config.kafkaPort, groupId)
+          val producerSettings = mkProducerSettings(config.kafkaPort)
+          val results =
+            program(consumerSettings, producerSettings, topic, data)
+              .unsafeRunSync()
 
-      results.collect { case Right(a) => a } should contain theSameElementsAs testData
+          results.collect { case Right(a) => a } should contain theSameElementsAs data
+      }
     }
   }
 }
 
-class PartitionedRecordStreamIntegrationSpec extends WordSpec with KafkaSettings {
-  def partitionedRecordStream(topic: String) =
+class PartitionedRecordStreamIntegrationSpec
+    extends WordSpec with KafkaSettings with GeneratorDrivenPropertyChecks {
+  def partitionedRecordStream(settings: ConsumerSettings, topic: String) =
     for {
-      consumer <- KafkaConsumer[IO](consumerSettings)
+      consumer <- KafkaConsumer[IO](settings)
       recordStream <- PartitionedRecordStream[IO, String](
-                       consumerSettings,
+                       settings,
                        consumer,
                        Subscription.Topics(List(topic)))
     } yield recordStream
 
-  def program(topic: String) =
+  def program(consumerSettings: ConsumerSettings,
+              producerSettings: ProducerSettings,
+              topic: String,
+              data: List[(Int, String)]) =
     for {
-      _ <- produce(testData, topic, 0)
-      _ <- produce(testData, topic, 1)
-      results <- partitionedRecordStream(topic) use { stream =>
+      _ <- produce(producerSettings, topic, data)
+      results <- partitionedRecordStream(consumerSettings, topic) use { stream =>
                   stream.records
                     .evalMap {
                       case (tp, stream) =>
@@ -119,19 +134,36 @@ class PartitionedRecordStreamIntegrationSpec extends WordSpec with KafkaSettings
                       } <* stream.commitQueue.requestCommit(
                         CommitRequest(rec.env.topic, rec.env.partition, rec.env.offset))
                     }
-                    .take(testData.length.toLong * 2)
+                    .take(data.length.toLong)
                     .compile
                     .toVector
                     .timeout(10.seconds)
                 }
     } yield results
 
-  "The partitioned consumer" should {
-    "work properly" in {
-      val results = program(Random.alphanumeric.take(5).mkString)
-        .unsafeRunSync()
+  implicit def noShrink[T]: Shrink[T] = Shrink.shrinkAny
 
-      results.collect { case Right(a) => a } should contain theSameElementsAs (testData ++ testData)
+  "The partitioned consumer" should {
+    "work properly" in withRunningKafkaOnFoundPort(kafkaConfig) { implicit config =>
+      val dataGen = for {
+        partitions <- Gen.chooseNum(1, 8)
+        data       <- Gen.listOf(Gen.zip(Gen.chooseNum(0, partitions - 1), Gen.alphaStr))
+      } yield (partitions, data)
+
+      val nonEmptyStr = Gen.nonEmptyListOf(Gen.alphaLowerChar).map(_.mkString)
+
+      forAll((nonEmptyStr, "topic"), (nonEmptyStr, "groupId"), (dataGen, "data")) {
+        case (topic, groupId, (partitions, data)) =>
+          createCustomTopic(topic, partitions = partitions)
+
+          val consumerSettings = mkConsumerSettings(config.kafkaPort, groupId)
+          val producerSettings = mkProducerSettings(config.kafkaPort)
+          val results =
+            program(consumerSettings, producerSettings, topic, data)
+              .unsafeRunSync()
+
+          results.collect { case Right(a) => a } should contain theSameElementsAs (data.map(_._2))
+      }
     }
   }
 }

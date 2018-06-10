@@ -2,7 +2,8 @@ package com.iravid.fs2.kafka.client
 
 import cats.effect.Resource
 import cats.effect.concurrent.Deferred
-import cats.effect.{ Concurrent, ConcurrentEffect, Sync, Timer }
+import cats.effect.{ ConcurrentEffect, Sync, Timer }
+import cats.effect.implicits._
 import cats.implicits._
 import com.iravid.fs2.kafka.EnvT
 import com.iravid.fs2.kafka.codecs.KafkaDecoder
@@ -24,23 +25,22 @@ object RecordStream {
       commits       = commitQueue.queue.dequeue
       polls         = Stream(Poll) ++ Stream.repeatEval(timer.sleep(settings.pollInterval).as(Poll))
       commandStream = shutdownQueue.dequeue.merge(commits.either(polls).map(_.some))
-      pollingLoop <- Concurrent[F].start {
-                      commandStream.unNoneTerminate
-                        .evalMap {
-                          case Left((deferred, req)) =>
-                            (consumer
-                              .commit(req.asOffsetMap)
-                              .void
-                              .attempt >>= deferred.complete).void
-                          case Right(Poll) =>
-                            for {
-                              records <- consumer.poll(settings.pollTimeout, settings.wakeupTimeout)
-                              _       <- records.traverse_(rec => outQueue.enqueue1(rec.some))
-                            } yield ()
-                        }
-                        .compile
-                        .drain
-                    }
+      pollingLoop <- commandStream.unNoneTerminate
+                      .evalMap {
+                        case Left((deferred, req)) =>
+                          (consumer
+                            .commit(req.asOffsetMap)
+                            .void
+                            .attempt >>= deferred.complete).void
+                        case Right(Poll) =>
+                          for {
+                            records <- consumer.poll(settings.pollTimeout, settings.wakeupTimeout)
+                            _       <- records.traverse_(rec => outQueue.enqueue1(rec.some))
+                          } yield ()
+                      }
+                      .compile
+                      .drain
+                      .start
       outputStream = outQueue.dequeue.unNoneTerminate
         .through(deserialize[F, T])
       performShutdown = shutdownQueue.enqueue1(None) *>

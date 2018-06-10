@@ -1,6 +1,6 @@
 package com.iravid.fs2.kafka.client
 
-import cats.effect._, cats.implicits._
+import cats.effect._, cats.effect.implicits._, cats.implicits._
 import cats.effect.concurrent.Ref
 import com.iravid.fs2.kafka.EnvT
 import com.iravid.fs2.kafka.codecs.KafkaDecoder
@@ -47,58 +47,57 @@ object PartitionedRecordStream {
 
       commandStream = shutdownQueue.dequeue.merge(commits.either(polls).map(_.some)).unNoneTerminate
 
-      pollingLoop <- Concurrent[F].start {
-                      commandStream
-                        .evalMap {
-                          case Left((deferred, req)) =>
-                            (consumer
-                              .commit(req.asOffsetMap)
-                              .void
-                              .attempt >>= deferred.complete).void
-                          case Right(Poll) =>
-                            for {
-                              records <- consumer
-                                          .poll(settings.pollTimeout, settings.wakeupTimeout)
-                              rebalances <- pendingRebalances.getAndSet(Nil)
-                              _ <- rebalances.reverse traverse_ {
-                                    case Rebalance.Assign(partitions) =>
-                                      for {
-                                        tracker <- partitionTracker.get
-                                        handles <- partitions.traverse(
-                                                    PartitionHandle
-                                                      .fromTopicPartition(
-                                                        _,
-                                                        settings.partitionOutputBufferSize))
-                                        _ <- partitionTracker.set(tracker ++ handles)
-                                        _ <- handles.traverse_ {
-                                              case (tp, h) =>
-                                                partitionsOut.enqueue1(
-                                                  (tp, h.records through deserialize[F, T]))
-                                            }
-                                      } yield ()
-                                    case Rebalance.Revoke(partitions) =>
-                                      for {
-                                        tracker <- partitionTracker.get
-                                        handles = partitions.flatMap(tracker.get)
-                                        _ <- handles.traverse_(_.data.enqueue1(none))
-                                        _ <- partitionTracker.set(tracker -- partitions)
-                                      } yield ()
+      pollingLoop <- commandStream
+                      .evalMap {
+                        case Left((deferred, req)) =>
+                          (consumer
+                            .commit(req.asOffsetMap)
+                            .void
+                            .attempt >>= deferred.complete).void
+                        case Right(Poll) =>
+                          for {
+                            records <- consumer
+                                        .poll(settings.pollTimeout, settings.wakeupTimeout)
+                            rebalances <- pendingRebalances.getAndSet(Nil)
+                            _ <- rebalances.reverse traverse_ {
+                                  case Rebalance.Assign(partitions) =>
+                                    for {
+                                      tracker <- partitionTracker.get
+                                      handles <- partitions.traverse(
+                                                  PartitionHandle
+                                                    .fromTopicPartition(
+                                                      _,
+                                                      settings.partitionOutputBufferSize))
+                                      _ <- partitionTracker.set(tracker ++ handles)
+                                      _ <- handles.traverse_ {
+                                            case (tp, h) =>
+                                              partitionsOut.enqueue1(
+                                                (tp, h.records through deserialize[F, T]))
+                                          }
+                                    } yield ()
+                                  case Rebalance.Revoke(partitions) =>
+                                    for {
+                                      tracker <- partitionTracker.get
+                                      handles = partitions.flatMap(tracker.get)
+                                      _ <- handles.traverse_(_.data.enqueue1(none))
+                                      _ <- partitionTracker.set(tracker -- partitions)
+                                    } yield ()
+                                }
+                            tracker <- partitionTracker.get
+                            _ <- records.traverse_ { record =>
+                                  tracker
+                                    .get(new TopicPartition(record.topic, record.partition)) match {
+                                    case Some(handle) => handle.data.enqueue1(record.some)
+                                    case None =>
+                                      F.raiseError[Unit](
+                                        new Exception("Got records for untracked partition"))
                                   }
-                              tracker <- partitionTracker.get
-                              _ <- records.traverse_ { record =>
-                                    tracker
-                                      .get(new TopicPartition(record.topic, record.partition)) match {
-                                      case Some(handle) => handle.data.enqueue1(record.some)
-                                      case None =>
-                                        F.raiseError[Unit](
-                                          new Exception("Got records for untracked partition"))
-                                    }
-                                  }
-                            } yield ()
-                        }
-                        .compile
-                        .drain
-                    }
+                                }
+                          } yield ()
+                      }
+                      .compile
+                      .drain
+                      .start
 
       performShutdown = shutdownQueue.enqueue1(None) *> pollingLoop.join
 
