@@ -2,7 +2,7 @@ package com.iravid.fs2.kafka.client
 
 import cats.effect.Resource
 import cats.effect.concurrent.Deferred
-import cats.effect.{ ConcurrentEffect, Sync, Timer }
+import cats.effect.{ ConcurrentEffect, Timer }
 import cats.effect.implicits._
 import cats.implicits._
 import com.iravid.fs2.kafka.EnvT
@@ -29,7 +29,7 @@ object RecordStream {
                       .evalMap {
                         case Left((deferred, req)) =>
                           (consumer
-                            .commit(req.asOffsetMap)
+                            .commit(req.offsets)
                             .void
                             .attempt >>= deferred.complete).void
                         case Right(Poll) =>
@@ -48,24 +48,15 @@ object RecordStream {
         pollingLoop.join
     } yield (commitQueue, outputStream, performShutdown)
 
-  def apply[F[_]: ConcurrentEffect, T: KafkaDecoder](
-    settings: ConsumerSettings,
-    consumer: Consumer[F],
-    subscription: Subscription)(implicit timer: Timer[F]): Resource[F, RecordStream[F, T]] =
-    Resource.make(resources[F, T](settings, consumer)) {
-      case (_, _, shutdown) =>
-        for {
-          _ <- shutdown
-          _ <- consumer.unsubscribe
-        } yield ()
-    } flatMap {
-      case (commitQueue, outputStream, _) =>
-        Resource.liftF {
-          consumer
-            .subscribe(subscription, _ => Sync[F].unit)
-            .as(RecordStream(commitQueue, outputStream))
-        }
-    }
+  def apply[F[_], T: KafkaDecoder](settings: ConsumerSettings,
+                                   consumer: Consumer[F],
+                                   subscription: Subscription)(
+    implicit F: ConcurrentEffect[F],
+    timer: Timer[F]): Resource[F, RecordStream[F, T]] =
+    for {
+      _         <- Resource.make(consumer.subscribe(subscription, _ => F.unit))(_ => consumer.unsubscribe)
+      streamRes <- Resource.make(resources[F, T](settings, consumer))(_._3)
+    } yield RecordStream(streamRes._1, streamRes._2)
 
   def deserialize[F[_], T: KafkaDecoder]: Pipe[F, ByteRecord, ConsumerMessage[Result, T]] =
     _.map(rec => EnvT(rec, KafkaDecoder[T].decode(rec)))

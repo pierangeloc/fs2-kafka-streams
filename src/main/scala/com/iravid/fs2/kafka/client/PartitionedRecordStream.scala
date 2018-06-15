@@ -51,7 +51,7 @@ object PartitionedRecordStream {
                       .evalMap {
                         case Left((deferred, req)) =>
                           (consumer
-                            .commit(req.asOffsetMap)
+                            .commit(req.offsets)
                             .void
                             .attempt >>= deferred.complete).void
                         case Right(Poll) =>
@@ -87,7 +87,8 @@ object PartitionedRecordStream {
                             _ <- records.traverse_ { record =>
                                   tracker
                                     .get(new TopicPartition(record.topic, record.partition)) match {
-                                    case Some(handle) => handle.data.enqueue1(record.some)
+                                    case Some(handle) =>
+                                      handle.data.enqueue1(record.some)
                                     case None =>
                                       F.raiseError[Unit](
                                         new Exception("Got records for untracked partition"))
