@@ -100,16 +100,17 @@ object RecordStream {
                             } yield ()
                         }
                     tracker <- partitionTracker.get
-                    _ <- records.traverse_ { record =>
-                          tracker
-                            .get(new TopicPartition(record.topic, record.partition)) match {
-                            case Some(handle) =>
-                              handle.data.enqueue1(record.some)
-                            case None =>
-                              F.raiseError[Unit](
-                                new Exception("Got records for untracked partition"))
+                    _ <- records.toList
+                          .traverse_ {
+                            case (tp, records) =>
+                              tracker.get(tp) match {
+                                case Some(handle) =>
+                                  records.traverse_(record => handle.data.enqueue1(record.some))
+                                case None =>
+                                  F.raiseError[Unit](
+                                    new Exception("Got records for untracked partition"))
+                              }
                           }
-                        }
                   } yield ()
               }
               .compile
