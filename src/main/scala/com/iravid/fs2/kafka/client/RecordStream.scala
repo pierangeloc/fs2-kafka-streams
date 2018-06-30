@@ -1,5 +1,6 @@
 package com.iravid.fs2.kafka.client
 
+import cats.effect.concurrent.Deferred
 import cats.{ Apply, Functor }
 import cats.effect._, cats.effect.implicits._, cats.implicits._
 import cats.effect.concurrent.Ref
@@ -7,6 +8,7 @@ import com.iravid.fs2.kafka.EnvT
 import com.iravid.fs2.kafka.codecs.KafkaDecoder
 import com.iravid.fs2.kafka.model.{ ByteRecord, ConsumerMessage, Result }
 import fs2._
+import fs2.async.mutable.Queue
 import org.apache.kafka.common.TopicPartition
 
 object RecordStream {
@@ -33,14 +35,141 @@ object RecordStream {
   }
 
   object PartitionHandle {
-    def fromTopicPartition[F[_]: Concurrent](
-      tp: TopicPartition): F[(TopicPartition, PartitionHandle[F])] =
+    def create[F[_]: Concurrent]: F[PartitionHandle[F]] =
       for {
         recordCount <- Ref[F].of(0)
         queue <- async
                   .unboundedQueue[F, Option[Chunk[ByteRecord]]]
-      } yield (tp, PartitionHandle(recordCount, queue))
+      } yield PartitionHandle(recordCount, queue)
   }
+
+  case class Resources[F[_], T](
+    consumer: Consumer[F],
+    polls: Stream[F, Poll.type],
+    commits: CommitQueue[F],
+    shutdownQueue: Queue[F, None.type],
+    partitionTracker: Ref[F, Map[TopicPartition, PartitionHandle[F]]],
+    pausedPartitions: Ref[F, Set[TopicPartition]],
+    pendingRebalances: Ref[F, List[Rebalance]],
+    partitionsQueue: Queue[
+      F,
+      Either[Throwable, Option[(TopicPartition, Stream[F, ConsumerMessage[Result, T]])]]]
+  ) {
+    def commandStream(implicit F: Concurrent[F])
+      : Stream[F, Either[(Deferred[F, Either[Throwable, Unit]], CommitRequest), Poll.type]] =
+      shutdownQueue.dequeue
+        .mergeHaltL(commits.queue.dequeue.either(polls).map(_.some))
+        .unNoneTerminate
+  }
+
+  def applyRebalanceEvents[F[_]: Concurrent, T: KafkaDecoder](
+    partitionTracker: Ref[F, Map[TopicPartition, PartitionHandle[F]]],
+    partitionsQueue: Queue[
+      F,
+      Either[Throwable, Option[(TopicPartition, Stream[F, ConsumerMessage[Result, T]])]]],
+    rebalances: List[Rebalance]): F[Unit] = rebalances.traverse_ {
+    case Rebalance.Assign(partitions) =>
+      for {
+        tracker <- partitionTracker.get
+        handles <- partitions.traverse(PartitionHandle.create.tupleLeft(_))
+        _       <- partitionTracker.set(tracker ++ handles)
+        _ <- handles.traverse_ {
+              case (tp, h) =>
+                partitionsQueue.enqueue1((tp, h.dequeue through deserialize[F, T]).some.asRight)
+            }
+      } yield ()
+    case Rebalance.Revoke(partitions) =>
+      for {
+        tracker <- partitionTracker.get
+        handles = partitions.flatMap(tracker.get)
+        _ <- handles.traverse_(_.complete)
+        _ <- partitionTracker.set(tracker -- partitions)
+      } yield ()
+
+  }
+
+  def resumePartitions[F[_]](
+    settings: ConsumerSettings,
+    pausedPartitions: Set[TopicPartition],
+    partitionTracker: Map[TopicPartition, PartitionHandle[F]]
+  )(implicit F: Concurrent[F]): F[List[TopicPartition]] =
+    pausedPartitions.toList.flatTraverse { tp =>
+      partitionTracker.get(tp) match {
+        case Some(handle) =>
+          handle.recordCount.get.map { count =>
+            if (count <= settings.partitionOutputBufferSize)
+              List(tp)
+            else Nil
+          }
+        case None =>
+          F.raiseError[List[TopicPartition]](new Exception)
+      }
+    }
+
+  def distributeRecords[F[_]](settings: ConsumerSettings,
+                              partitionTracker: Map[TopicPartition, PartitionHandle[F]],
+                              records: Map[TopicPartition, List[ByteRecord]])(
+    implicit F: Concurrent[F]): F[List[TopicPartition]] =
+    records.toList.flatTraverse {
+      case (tp, records) =>
+        partitionTracker.get(tp) match {
+          case Some(handle) =>
+            for {
+              _           <- handle.enqueue(Chunk.seq(records))
+              recordCount <- handle.recordCount.get
+              shouldPause = if (recordCount <= settings.partitionOutputBufferSize)
+                Nil
+              else
+                List(tp)
+            } yield shouldPause
+          case None =>
+            F.raiseError[List[TopicPartition]](new Exception("Got records for untracked partition"))
+        }
+    }
+
+  def commandHandler[F[_], T: KafkaDecoder](
+    resources: Resources[F, T],
+    settings: ConsumerSettings,
+    command: Either[(Deferred[F, Either[Throwable, Unit]], CommitRequest), Poll.type])(
+    implicit F: Concurrent[F]): F[Unit] =
+    command match {
+      case Left((deferred, req)) =>
+        (resources.consumer
+          .commit(req.offsets)
+          .void
+          .attempt >>= deferred.complete).void
+      case Right(Poll) =>
+        for {
+          resumablePartitions <- for {
+                                  paused    <- resources.pausedPartitions.get
+                                  tracker   <- resources.partitionTracker.get
+                                  resumable <- resumePartitions(settings, paused, tracker)
+                                } yield resumable
+          _ <- resources.consumer.resume(resumablePartitions) *>
+                resources.pausedPartitions.update(_ -- resumablePartitions)
+
+          records    <- resources.consumer.poll(settings.pollTimeout, settings.wakeupTimeout)
+          rebalances <- resources.pendingRebalances.getAndSet(Nil).map(_.reverse)
+
+          _ <- applyRebalanceEvents(
+                resources.partitionTracker,
+                resources.partitionsQueue,
+                rebalances
+              )
+
+          partitionsToPause <- for {
+                                tracker           <- resources.partitionTracker.get
+                                partitionsToPause <- distributeRecords(settings, tracker, records)
+                              } yield partitionsToPause
+          _ <- resources.consumer.pause(partitionsToPause) *>
+                resources.pausedPartitions.update(_ ++ partitionsToPause)
+        } yield ()
+    }
+
+  def pollingLoop[F[_], T: KafkaDecoder](resources: Resources[F, T], settings: ConsumerSettings)(
+    implicit F: Concurrent[F]) =
+    resources.commandStream
+      .evalMap(commandHandler(resources, settings, _))
 
   def partitioned[F[_], T: KafkaDecoder](
     settings: ConsumerSettings,
@@ -55,107 +184,38 @@ object RecordStream {
       _ <- Resource.make(consumer.subscribe(subscription, rebalanceListener))(_ =>
             consumer.unsubscribe)
 
-      partitionTracker <- Resource.liftF(Ref[F].of(Map.empty[TopicPartition, PartitionHandle[F]]))
-      partitionsQueue <- Resource.liftF(
-                          async
-                            .unboundedQueue[
-                              F,
-                              Either[
-                                Throwable,
-                                Option[(TopicPartition, Stream[F, ConsumerMessage[Result, T]])]]])
-      partitionsOut = partitionsQueue.dequeue.rethrow.unNoneTerminate
+      resources <- Resource.liftF {
+                    for {
+                      partitionTracker <- Ref[F].of(Map.empty[TopicPartition, PartitionHandle[F]])
+                      partitionsQueue <- async.unboundedQueue[
+                                          F,
+                                          Either[Throwable,
+                                                 Option[(TopicPartition,
+                                                         Stream[F, ConsumerMessage[Result, T]])]]]
+                      pausedPartitions <- Ref[F].of(Set.empty[TopicPartition])
+                      commitQueue      <- CommitQueue.create[F](settings.maxPendingCommits)
+                      shutdownQueue    <- async.boundedQueue[F, None.type](1)
+                      polls = Stream(Poll) ++ Stream.fixedRate(settings.pollInterval).as(Poll)
 
-      pausedPartitions <- Resource.liftF(Ref[F].of(Set.empty[TopicPartition]))
+                    } yield
+                      Resources(
+                        consumer,
+                        polls,
+                        commitQueue,
+                        shutdownQueue,
+                        partitionTracker,
+                        pausedPartitions,
+                        pendingRebalances,
+                        partitionsQueue)
+                  }
 
-      commitQueue <- Resource.liftF(CommitQueue.create[F](settings.maxPendingCommits))
-      commits         = commitQueue.queue.dequeue
-      polls           = Stream(Poll) ++ Stream.fixedRate(settings.pollInterval).as(Poll)
-      commitsAndPolls = commits.either(polls).map(_.some)
-
-      shutdownQueue <- Resource.liftF(async.boundedQueue[F, None.type](1))
-      commandStream = shutdownQueue.dequeue
-        .mergeHaltL(commitsAndPolls)
-        .unNoneTerminate
+      partitionsOut = resources.partitionsQueue.dequeue.rethrow.unNoneTerminate
 
       _ <- Resource.make {
-            commandStream
-              .evalMap {
-                case Left((deferred, req)) =>
-                  (consumer
-                    .commit(req.offsets)
-                    .void
-                    .attempt >>= deferred.complete).void
-                case Right(Poll) =>
-                  for {
-                    _ <- for {
-                          paused  <- pausedPartitions.get
-                          tracker <- partitionTracker.get
-                          _ <- paused.toList.traverse_ { tp =>
-                                tracker.get(tp) match {
-                                  case Some(handle) =>
-                                    handle.recordCount.get.flatMap { count =>
-                                      if (count <= settings.partitionOutputBufferSize)
-                                        consumer.resume(List(tp)) *>
-                                          pausedPartitions.update(_ - tp)
-                                      else F.unit
-                                    }
-                                  case None =>
-                                    F.raiseError[Unit](new Exception)
-                                }
-                              }
-                        } yield ()
-                    records <- consumer
-                                .poll(settings.pollTimeout, settings.wakeupTimeout)
-                    rebalances <- pendingRebalances.getAndSet(Nil)
-                    _ <- rebalances.reverse traverse_ {
-                          case Rebalance.Assign(partitions) =>
-                            for {
-                              tracker <- partitionTracker.get
-                              handles <- partitions.traverse(PartitionHandle
-                                          .fromTopicPartition(_))
-                              _ <- partitionTracker.set(tracker ++ handles)
-                              _ <- handles.traverse_ {
-                                    case (tp, h) =>
-                                      partitionsQueue.enqueue1(
-                                        (tp, h.dequeue through deserialize[F, T]).some.asRight)
-                                  }
-                            } yield ()
-                          case Rebalance.Revoke(partitions) =>
-                            for {
-                              tracker <- partitionTracker.get
-                              handles = partitions.flatMap(tracker.get)
-                              _ <- handles.traverse_(_.complete)
-                              _ <- partitionTracker.set(tracker -- partitions)
-                            } yield ()
-                        }
-                    tracker <- partitionTracker.get
-                    _ <- records.toList
-                          .traverse_ {
-                            case (tp, records) =>
-                              tracker.get(tp) match {
-                                case Some(handle) =>
-                                  for {
-                                    _           <- handle.enqueue(Chunk.seq(records))
-                                    recordCount <- handle.recordCount.get
-                                    _ <- if (recordCount <= settings.partitionOutputBufferSize)
-                                          F.unit
-                                        else
-                                          consumer.pause(List(tp)) *>
-                                            pausedPartitions.update(_ + tp)
-                                  } yield ()
-                                case None =>
-                                  F.raiseError[Unit](
-                                    new Exception("Got records for untracked partition"))
-                              }
-                          }
-                  } yield ()
-              }
-              .compile
-              .drain
-              .start
-          }(fiber => shutdownQueue.enqueue1(None) *> fiber.join)
+            pollingLoop(resources, settings).compile.drain.start
+          }(fiber => resources.shutdownQueue.enqueue1(None) *> fiber.join)
 
-    } yield Partitioned(commitQueue, partitionsOut)
+    } yield Partitioned(resources.commits, partitionsOut)
 
   def plain[F[_]: ConcurrentEffect: Timer, T: KafkaDecoder](
     settings: ConsumerSettings,
