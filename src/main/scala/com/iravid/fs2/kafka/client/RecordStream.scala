@@ -24,9 +24,9 @@ object RecordStream {
     def fromTopicPartition[F[_]: Concurrent](
       tp: TopicPartition,
       bufferSize: Int): F[(TopicPartition, PartitionHandle[F])] =
-      for {
-        queue <- async.boundedQueue[F, Option[ByteRecord]](bufferSize)
-      } yield (tp, PartitionHandle(queue))
+      async
+        .boundedQueue[F, Option[ByteRecord]](bufferSize)
+        .map(queue => (tp, PartitionHandle(queue)))
   }
 
   def partitioned[F[_], T: KafkaDecoder](
@@ -42,19 +42,25 @@ object RecordStream {
       _ <- Resource.make(consumer.subscribe(subscription, rebalanceListener))(_ =>
             consumer.unsubscribe)
 
-      shutdownQueue    <- Resource.liftF(async.boundedQueue[F, None.type](1))
-      commitQueue      <- Resource.liftF(CommitQueue.create[F](settings.maxPendingCommits))
       partitionTracker <- Resource.liftF(Ref[F].of(Map.empty[TopicPartition, PartitionHandle[F]]))
-      partitionsOut <- Resource.liftF(async
-                        .unboundedQueue[
-                          F,
-                          Either[Throwable,
-                                 Option[(TopicPartition, Stream[F, ConsumerMessage[Result, T]])]]])
+      partitionsQueue <- Resource.liftF(
+                          async
+                            .unboundedQueue[
+                              F,
+                              Either[
+                                Throwable,
+                                Option[(TopicPartition, Stream[F, ConsumerMessage[Result, T]])]]])
+      partitionsOut = partitionsQueue.dequeue.rethrow.unNoneTerminate
 
-      commits = commitQueue.queue.dequeue
-      polls   = Stream(Poll) ++ Stream.repeatEval(timer.sleep(settings.pollInterval).as(Poll))
+      commitQueue <- Resource.liftF(CommitQueue.create[F](settings.maxPendingCommits))
+      commits         = commitQueue.queue.dequeue
+      polls           = Stream(Poll) ++ Stream.fixedRate(settings.pollInterval).as(Poll)
+      commitsAndPolls = commits.either(polls).map(_.some)
 
-      commandStream = shutdownQueue.dequeue.merge(commits.either(polls).map(_.some)).unNoneTerminate
+      shutdownQueue <- Resource.liftF(async.boundedQueue[F, None.type](1))
+      commandStream = shutdownQueue.dequeue
+        .mergeHaltL(commitsAndPolls)
+        .unNoneTerminate
 
       _ <- Resource.make {
             commandStream
@@ -81,7 +87,7 @@ object RecordStream {
                               _ <- partitionTracker.set(tracker ++ handles)
                               _ <- handles.traverse_ {
                                     case (tp, h) =>
-                                      partitionsOut.enqueue1(
+                                      partitionsQueue.enqueue1(
                                         (tp, h.records through deserialize[F, T]).some.asRight)
                                   }
                             } yield ()
@@ -111,7 +117,7 @@ object RecordStream {
               .start
           }(fiber => shutdownQueue.enqueue1(None) *> fiber.join)
 
-    } yield Partitioned(commitQueue, partitionsOut.dequeue.rethrow.unNoneTerminate)
+    } yield Partitioned(commitQueue, partitionsOut)
 
   def plain[F[_]: ConcurrentEffect: Timer, T: KafkaDecoder](
     settings: ConsumerSettings,
