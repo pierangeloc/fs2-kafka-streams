@@ -16,22 +16,20 @@ object RecordStream {
   case class Plain[F[_], T](commitQueue: CommitQueue[F],
                             records: Stream[F, ConsumerMessage[Result, T]])
 
-  case class PartitionHandle[F[_]](
-    recordCount: Ref[F, Int],
-    data: async.mutable.Queue[F, Option[(Segment[ByteRecord, Unit], Int)]]) {
-    def enqueue(segment: Segment[ByteRecord, Unit], size: Int)(implicit F: Apply[F]): F[Unit] =
-      recordCount.update(_ + size) *>
-        data.enqueue1((segment -> size).some)
+  case class PartitionHandle[F[_]](recordCount: Ref[F, Int],
+                                   data: async.mutable.Queue[F, Option[Chunk[ByteRecord]]]) {
+    def enqueue(chunk: Chunk[ByteRecord])(implicit F: Apply[F]): F[Unit] =
+      recordCount.update(_ + chunk.size) *>
+        data.enqueue1(chunk.some)
 
     def complete: F[Unit] = data.enqueue1(none)
 
     def dequeue(implicit F: Functor[F]): Stream[F, ByteRecord] =
       data.dequeue.unNoneTerminate
-        .evalMap {
-          case (segment, size) =>
-            recordCount.update(_ - size).as(segment)
+        .evalMap { chunk =>
+          recordCount.update(_ - chunk.size).as(chunk)
         }
-        .flatMap(Stream.segment(_))
+        .flatMap(Stream.chunk(_))
   }
 
   object PartitionHandle {
@@ -40,7 +38,7 @@ object RecordStream {
       for {
         recordCount <- Ref[F].of(0)
         queue <- async
-                  .unboundedQueue[F, Option[(Segment[ByteRecord, Unit], Int)]]
+                  .unboundedQueue[F, Option[Chunk[ByteRecord]]]
       } yield (tp, PartitionHandle(recordCount, queue))
   }
 
@@ -117,7 +115,7 @@ object RecordStream {
                             case (tp, records) =>
                               tracker.get(tp) match {
                                 case Some(handle) =>
-                                  handle.enqueue(Segment.seq(records), records.size)
+                                  handle.enqueue(Chunk.seq(records))
                                 case None =>
                                   F.raiseError[Unit](
                                     new Exception("Got records for untracked partition"))
