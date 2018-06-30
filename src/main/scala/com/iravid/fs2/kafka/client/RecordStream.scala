@@ -1,5 +1,6 @@
 package com.iravid.fs2.kafka.client
 
+import cats.{ Apply, Functor }
 import cats.effect._, cats.effect.implicits._, cats.implicits._
 import cats.effect.concurrent.Ref
 import com.iravid.fs2.kafka.EnvT
@@ -15,18 +16,32 @@ object RecordStream {
   case class Plain[F[_], T](commitQueue: CommitQueue[F],
                             records: Stream[F, ConsumerMessage[Result, T]])
 
-  case class PartitionHandle[F[_]](data: async.mutable.Queue[F, Option[ByteRecord]]) {
-    def records: Stream[F, ByteRecord] =
+  case class PartitionHandle[F[_]](
+    recordCount: Ref[F, Int],
+    data: async.mutable.Queue[F, Option[(Segment[ByteRecord, Unit], Int)]]) {
+    def enqueue(segment: Segment[ByteRecord, Unit], size: Int)(implicit F: Apply[F]): F[Unit] =
+      recordCount.update(_ + size) *>
+        data.enqueue1((segment -> size).some)
+
+    def complete: F[Unit] = data.enqueue1(none)
+
+    def dequeue(implicit F: Functor[F]): Stream[F, ByteRecord] =
       data.dequeue.unNoneTerminate
+        .evalMap {
+          case (segment, size) =>
+            recordCount.update(_ - size).as(segment)
+        }
+        .flatMap(Stream.segment(_))
   }
 
   object PartitionHandle {
     def fromTopicPartition[F[_]: Concurrent](
-      tp: TopicPartition,
-      bufferSize: Int): F[(TopicPartition, PartitionHandle[F])] =
-      async
-        .boundedQueue[F, Option[ByteRecord]](bufferSize)
-        .map(queue => (tp, PartitionHandle(queue)))
+      tp: TopicPartition): F[(TopicPartition, PartitionHandle[F])] =
+      for {
+        recordCount <- Ref[F].of(0)
+        queue <- async
+                  .unboundedQueue[F, Option[(Segment[ByteRecord, Unit], Int)]]
+      } yield (tp, PartitionHandle(recordCount, queue))
   }
 
   def partitioned[F[_], T: KafkaDecoder](
@@ -79,23 +94,20 @@ object RecordStream {
                           case Rebalance.Assign(partitions) =>
                             for {
                               tracker <- partitionTracker.get
-                              handles <- partitions.traverse(
-                                          PartitionHandle
-                                            .fromTopicPartition(
-                                              _,
-                                              settings.partitionOutputBufferSize))
+                              handles <- partitions.traverse(PartitionHandle
+                                          .fromTopicPartition(_))
                               _ <- partitionTracker.set(tracker ++ handles)
                               _ <- handles.traverse_ {
                                     case (tp, h) =>
                                       partitionsQueue.enqueue1(
-                                        (tp, h.records through deserialize[F, T]).some.asRight)
+                                        (tp, h.dequeue through deserialize[F, T]).some.asRight)
                                   }
                             } yield ()
                           case Rebalance.Revoke(partitions) =>
                             for {
                               tracker <- partitionTracker.get
                               handles = partitions.flatMap(tracker.get)
-                              _ <- handles.traverse_(_.data.enqueue1(none))
+                              _ <- handles.traverse_(_.complete)
                               _ <- partitionTracker.set(tracker -- partitions)
                             } yield ()
                         }
@@ -105,7 +117,7 @@ object RecordStream {
                             case (tp, records) =>
                               tracker.get(tp) match {
                                 case Some(handle) =>
-                                  records.traverse_(record => handle.data.enqueue1(record.some))
+                                  handle.enqueue(Segment.seq(records), records.size)
                                 case None =>
                                   F.raiseError[Unit](
                                     new Exception("Got records for untracked partition"))
