@@ -65,6 +65,8 @@ object RecordStream {
                                 Option[(TopicPartition, Stream[F, ConsumerMessage[Result, T]])]]])
       partitionsOut = partitionsQueue.dequeue.rethrow.unNoneTerminate
 
+      pausedPartitions <- Resource.liftF(Ref[F].of(Set.empty[TopicPartition]))
+
       commitQueue <- Resource.liftF(CommitQueue.create[F](settings.maxPendingCommits))
       commits         = commitQueue.queue.dequeue
       polls           = Stream(Poll) ++ Stream.fixedRate(settings.pollInterval).as(Poll)
@@ -85,6 +87,23 @@ object RecordStream {
                     .attempt >>= deferred.complete).void
                 case Right(Poll) =>
                   for {
+                    _ <- for {
+                          paused  <- pausedPartitions.get
+                          tracker <- partitionTracker.get
+                          _ <- paused.toList.traverse_ { tp =>
+                                tracker.get(tp) match {
+                                  case Some(handle) =>
+                                    handle.recordCount.get.flatMap { count =>
+                                      if (count <= settings.partitionOutputBufferSize)
+                                        consumer.resume(List(tp)) *>
+                                          pausedPartitions.update(_ - tp)
+                                      else F.unit
+                                    }
+                                  case None =>
+                                    F.raiseError[Unit](new Exception)
+                                }
+                              }
+                        } yield ()
                     records <- consumer
                                 .poll(settings.pollTimeout, settings.wakeupTimeout)
                     rebalances <- pendingRebalances.getAndSet(Nil)
@@ -115,7 +134,15 @@ object RecordStream {
                             case (tp, records) =>
                               tracker.get(tp) match {
                                 case Some(handle) =>
-                                  handle.enqueue(Chunk.seq(records))
+                                  for {
+                                    _           <- handle.enqueue(Chunk.seq(records))
+                                    recordCount <- handle.recordCount.get
+                                    _ <- if (recordCount <= settings.partitionOutputBufferSize)
+                                          F.unit
+                                        else
+                                          consumer.pause(List(tp)) *>
+                                            pausedPartitions.update(_ + tp)
+                                  } yield ()
                                 case None =>
                                   F.raiseError[Unit](
                                     new Exception("Got records for untracked partition"))

@@ -22,6 +22,10 @@ trait Consumer[F[_]] {
   def subscribe(subscription: Subscription, listener: Rebalance.Listener[F]): F[Unit]
 
   def unsubscribe: F[Unit]
+
+  def pause(partitions: List[TopicPartition]): F[Unit]
+
+  def resume(partitions: List[TopicPartition]): F[Unit]
 }
 
 class KafkaConsumer[F[_]](consumer: ByteConsumer)(implicit F: ConcurrentEffect[F], timer: Timer[F])
@@ -87,6 +91,12 @@ class KafkaConsumer[F[_]](consumer: ByteConsumer)(implicit F: ConcurrentEffect[F
   }
 
   def unsubscribe: F[Unit] = F.delay(consumer.unsubscribe())
+
+  def pause(partitions: List[TopicPartition]): F[Unit] =
+    F.delay(consumer.pause(partitions.asJava))
+
+  def resume(partitions: List[TopicPartition]): F[Unit] =
+    F.delay(consumer.resume(partitions.asJava))
 }
 
 object KafkaConsumer {
